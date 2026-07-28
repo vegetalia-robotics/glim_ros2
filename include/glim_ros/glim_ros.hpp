@@ -7,6 +7,7 @@
 
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #ifdef BUILD_WITH_CV_BRIDGE
 #include <image_transport/image_transport.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -38,6 +39,7 @@ public:
 
   void wait(bool auto_quit = false);
   void save(const std::string& path);
+  bool snapshot(const std::string& path, std::string& error);
 
   const std::vector<std::shared_ptr<GenericTopicSubscription>>& extension_subscriptions();
 
@@ -48,6 +50,8 @@ private:
   std::shared_ptr<glim::AsyncOdometryEstimation> odometry_estimation;
   std::unique_ptr<glim::AsyncSubMapping> sub_mapping;
   std::unique_ptr<glim::AsyncGlobalMapping> global_mapping;
+  std::string sub_mapping_so_name;
+  std::string loaded_map_path;
 
   bool keep_raw_points;
   double imu_time_offset;
@@ -65,6 +69,8 @@ private:
   rclcpp::TimerBase::SharedPtr timer;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_map_service;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_status_service;
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;
 #endif
