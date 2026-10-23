@@ -3,6 +3,7 @@
 #include <any>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <rclcpp/rclcpp.hpp>
 
 #include <sensor_msgs/msg/imu.hpp>
@@ -71,6 +72,10 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_map_service;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_status_service;
+  // save_map runs beside the sensor callbacks on a second executor thread (see snapshot());
+  // sub_mapping is replaced there, so every access from the callbacks takes sub_mapping_mutex.
+  rclcpp::CallbackGroup::SharedPtr save_map_group;
+  std::mutex sub_mapping_mutex;
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;
 #endif

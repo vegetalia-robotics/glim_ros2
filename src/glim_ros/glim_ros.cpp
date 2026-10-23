@@ -130,6 +130,10 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // session.  Stopping GLIM changes the map frame and makes the just-taught
   // waypoints unusable until a separate relocalization step succeeds.
   this->declare_parameter<std::string>("snapshot_path", "");
+  // snapshot() waits for the local mapper, flushes the global mapper and writes the map (tens of
+  // seconds).  It must not block the executor thread that serves the IMU / points callbacks, so the
+  // service gets its own callback group and main() spins a two-thread executor.
+  save_map_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   save_map_service = this->create_service<std_srvs::srv::Trigger>(
     "~/save_map",
     [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
@@ -138,7 +142,9 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
       std::string error;
       response->success = snapshot(path, error);
       response->message = response->success ? path : error;
-    });
+    },
+    rclcpp::ServicesQoS(),
+    save_map_group);
 
   // Global mapping module.  Keep it synchronous until extension callbacks are
   // installed so loading a saved dump also publishes its submaps to ROS.
@@ -305,8 +311,11 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   }
 
   odometry_estimation->insert_imu(imu_stamp, linear_acc, angular_vel);
-  if (sub_mapping) {
-    sub_mapping->insert_imu(imu_stamp, linear_acc, angular_vel);
+  {
+    std::lock_guard<std::mutex> lock(sub_mapping_mutex);
+    if (sub_mapping) {
+      sub_mapping->insert_imu(imu_stamp, linear_acc, angular_vel);
+    }
   }
   if (global_mapping) {
     global_mapping->insert_imu(imu_stamp, linear_acc, angular_vel);
@@ -325,8 +334,11 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 
   const double stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
   odometry_estimation->insert_image(stamp, cv_image->image);
-  if (sub_mapping) {
-    sub_mapping->insert_image(stamp, cv_image->image);
+  {
+    std::lock_guard<std::mutex> lock(sub_mapping_mutex);
+    if (sub_mapping) {
+      sub_mapping->insert_image(stamp, cv_image->image);
+    }
   }
   if (global_mapping) {
     global_mapping->insert_image(stamp, cv_image->image);
@@ -389,6 +401,7 @@ void GlimROS::timer_callback() {
   std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
   odometry_estimation->get_results(estimation_frames, marginalized_frames);
 
+  std::lock_guard<std::mutex> lock(sub_mapping_mutex);
   if (sub_mapping) {
     for (const auto& frame : marginalized_frames) {
       sub_mapping->insert_frame(frame);
@@ -407,6 +420,7 @@ void GlimROS::wait(bool auto_quit) {
   spdlog::info("waiting for odometry estimation");
   odometry_estimation->join();
 
+  std::lock_guard<std::mutex> lock(sub_mapping_mutex);
   if (sub_mapping) {
     std::vector<glim::EstimationFrame::ConstPtr> estimation_results;
     std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
@@ -466,18 +480,28 @@ bool GlimROS::snapshot(const std::string& path, std::string& error) {
     // Close only the current local submap so the final part of the driven lap
     // is included.  Recreate the local mapper immediately afterwards; odometry
     // and the global mapper remain alive, so map/odom authority never changes.
-    if (sub_mapping) {
-      sub_mapping->join();
-      const auto submaps = sub_mapping->get_results();
+    // Swap in a fresh local mapper first (under the mutex, so the callbacks on the other executor
+    // thread never touch a mapper that is being replaced), then finish the old one outside the lock:
+    // the sensor callbacks keep feeding the odometry and the new mapper while this thread waits.
+    std::unique_ptr<AsyncSubMapping> closing;
+    {
+      std::lock_guard<std::mutex> lock(sub_mapping_mutex);
+      if (sub_mapping) {
+        auto next = SubMappingBase::load_module(sub_mapping_so_name);
+        if (!next) {
+          error = "failed to restart local mapping after snapshot";
+          return false;
+        }
+        closing = std::move(sub_mapping);
+        sub_mapping.reset(new AsyncSubMapping(next));
+      }
+    }
+    if (closing) {
+      closing->join();
+      const auto submaps = closing->get_results();
       for (const auto& submap : submaps) {
         global_mapping->insert_submap(submap);
       }
-      auto next = SubMappingBase::load_module(sub_mapping_so_name);
-      if (!next) {
-        error = "failed to restart local mapping after snapshot";
-        return false;
-      }
-      sub_mapping.reset(new AsyncSubMapping(next));
     }
 
     // Wait until the global worker has taken the flushed submap.  save() then
