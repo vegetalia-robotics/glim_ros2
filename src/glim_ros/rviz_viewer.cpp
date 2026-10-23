@@ -31,7 +31,10 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
   publish_imu2lidar = config.param<bool>("glim_ros", "publish_imu2lidar", true);
   tf_time_offset = config.param<double>("glim_ros", "tf_time_offset", 1e-6);
 
-  last_globalmap_pub_time = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
+  // Allow the first complete graph update (including a startup map load) to
+  // publish immediately.  The transient-local publisher then retains it for
+  // UI/RViz subscribers that connect later.
+  last_globalmap_pub_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
   trajectory.reset(new TrajectoryManager);
 
   set_callbacks();
@@ -617,17 +620,18 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
   }
 
   std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> submap_poses(submaps.size());
+  std::vector<gtsam_points::PointCloud::ConstPtr> submap_frames;
+  submap_frames.reserve(submaps.size());
   for (int i = 0; i < submaps.size(); i++) {
     submap_poses[i] = submaps[i]->T_world_origin;
+    submap_frames.push_back(submaps[i]->frame);
   }
 
   // Invoke a submap concatenation task in the RvizViewer thread
-  invoke([this, latest_submap, submap_poses] {
-    this->submaps.push_back(latest_submap->frame);
-
-    if (!map_pub->get_subscription_count()) {
-      return;
-    }
+  invoke([this, submap_frames, submap_poses] {
+    // on_update_submaps carries the complete graph, including submaps loaded
+    // from disk.  Rebuild the cache instead of appending only the latest one.
+    this->submaps = submap_frames;
 
     // Publish global map every 10 seconds
     const rclcpp::Time now = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();

@@ -3,6 +3,8 @@
 #define GLIM_ROS2
 
 #include <deque>
+#include <filesystem>
+#include <stdexcept>
 #include <thread>
 #include <iostream>
 #include <functional>
@@ -38,6 +40,8 @@
 #include <glim_ros/ros_qos.hpp>
 
 namespace glim {
+
+namespace fs = std::filesystem;
 
 GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options) {
   // Setup logger
@@ -111,7 +115,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   // Sub mapping
   if (config_ros.param<bool>("glim_ros", "enable_local_mapping", true)) {
-    const std::string sub_mapping_so_name =
+    sub_mapping_so_name =
       glim::Config(glim::GlobalConfig::get_config_path("config_sub_mapping")).param<std::string>("sub_mapping", "so_name", "libsub_mapping.so");
     if (!sub_mapping_so_name.empty()) {
       spdlog::info("load {}", sub_mapping_so_name);
@@ -122,16 +126,36 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     }
   }
 
-  // Global mapping
+  // A mapping result must be persisted without tearing down the live SLAM
+  // session.  Stopping GLIM changes the map frame and makes the just-taught
+  // waypoints unusable until a separate relocalization step succeeds.
+  this->declare_parameter<std::string>("snapshot_path", "");
+  // snapshot() waits for the local mapper, flushes the global mapper and writes the map (tens of
+  // seconds).  It must not block the executor thread that serves the IMU / points callbacks, so the
+  // service gets its own callback group and main() spins a two-thread executor.
+  save_map_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  save_map_service = this->create_service<std_srvs::srv::Trigger>(
+    "~/save_map",
+    [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+           std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+      const std::string path = this->get_parameter("snapshot_path").as_string();
+      std::string error;
+      response->success = snapshot(path, error);
+      response->message = response->success ? path : error;
+    },
+    rclcpp::ServicesQoS(),
+    save_map_group);
+
+  // Global mapping module.  Keep it synchronous until extension callbacks are
+  // installed so loading a saved dump also publishes its submaps to ROS.
+  std::shared_ptr<GlobalMappingBase> global_mapping_module;
   if (config_ros.param<bool>("glim_ros", "enable_global_mapping", true)) {
     const std::string global_mapping_so_name =
       glim::Config(glim::GlobalConfig::get_config_path("config_global_mapping")).param<std::string>("global_mapping", "so_name", "libglobal_mapping.so");
     if (!global_mapping_so_name.empty()) {
       spdlog::info("load {}", global_mapping_so_name);
-      auto global = GlobalMappingBase::load_module(global_mapping_so_name);
-      if (global) {
-        global_mapping.reset(new AsyncGlobalMapping(global));
-      }
+      global_mapping_module = GlobalMappingBase::load_module(
+        global_mapping_so_name);
     }
   }
 
@@ -172,6 +196,44 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
       }
     }
   }
+
+  // Continue from a versioned dump when explicitly requested.  GLIM already
+  // implements GlobalMapping::load(), but the ROS live node previously never
+  // called it and therefore always started an empty coordinate system.
+  this->declare_parameter<std::string>("initial_map_path", "");
+  std::string initial_map_path;
+  this->get_parameter<std::string>("initial_map_path", initial_map_path);
+  if (!initial_map_path.empty()) {
+    const fs::path requested(initial_map_path);
+    if (!requested.is_absolute()
+        || !fs::is_regular_file(requested / "graph.txt")) {
+      throw std::runtime_error(
+        "initial_map_path must be an absolute GLIM dump containing graph.txt: "
+        + initial_map_path);
+    }
+    if (!global_mapping_module) {
+      throw std::runtime_error(
+        "initial_map_path was requested but global mapping is disabled");
+    }
+    spdlog::info("loading initial GLIM map {}", initial_map_path);
+    if (!global_mapping_module->load(initial_map_path)) {
+      throw std::runtime_error(
+        "failed to load initial GLIM map: " + initial_map_path);
+    }
+    loaded_map_path = fs::weakly_canonical(requested).string();
+    spdlog::info("initial GLIM map loaded: {}", loaded_map_path);
+  }
+  if (global_mapping_module) {
+    global_mapping.reset(new AsyncGlobalMapping(global_mapping_module));
+  }
+  map_status_service = this->create_service<std_srvs::srv::Trigger>(
+    "~/map_status",
+    [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+           std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+      response->success = !loaded_map_path.empty();
+      response->message = response->success
+        ? loaded_map_path : "no saved GLIM map loaded";
+    });
 
   // ROS-related
   using std::placeholders::_1;
@@ -249,8 +311,11 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   }
 
   odometry_estimation->insert_imu(imu_stamp, linear_acc, angular_vel);
-  if (sub_mapping) {
-    sub_mapping->insert_imu(imu_stamp, linear_acc, angular_vel);
+  {
+    std::lock_guard<std::mutex> lock(sub_mapping_mutex);
+    if (sub_mapping) {
+      sub_mapping->insert_imu(imu_stamp, linear_acc, angular_vel);
+    }
   }
   if (global_mapping) {
     global_mapping->insert_imu(imu_stamp, linear_acc, angular_vel);
@@ -269,8 +334,11 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 
   const double stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
   odometry_estimation->insert_image(stamp, cv_image->image);
-  if (sub_mapping) {
-    sub_mapping->insert_image(stamp, cv_image->image);
+  {
+    std::lock_guard<std::mutex> lock(sub_mapping_mutex);
+    if (sub_mapping) {
+      sub_mapping->insert_image(stamp, cv_image->image);
+    }
   }
   if (global_mapping) {
     global_mapping->insert_image(stamp, cv_image->image);
@@ -333,6 +401,7 @@ void GlimROS::timer_callback() {
   std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
   odometry_estimation->get_results(estimation_frames, marginalized_frames);
 
+  std::lock_guard<std::mutex> lock(sub_mapping_mutex);
   if (sub_mapping) {
     for (const auto& frame : marginalized_frames) {
       sub_mapping->insert_frame(frame);
@@ -351,6 +420,7 @@ void GlimROS::wait(bool auto_quit) {
   spdlog::info("waiting for odometry estimation");
   odometry_estimation->join();
 
+  std::lock_guard<std::mutex> lock(sub_mapping_mutex);
   if (sub_mapping) {
     std::vector<glim::EstimationFrame::ConstPtr> estimation_results;
     std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
@@ -388,6 +458,72 @@ void GlimROS::save(const std::string& path) {
   }
   for (auto& module : extension_modules) {
     module->at_exit(path);
+  }
+}
+
+bool GlimROS::snapshot(const std::string& path, std::string& error) {
+  namespace fs = std::filesystem;
+  if (path.empty() || !fs::path(path).is_absolute()) {
+    error = "snapshot_path must be an absolute path";
+    return false;
+  }
+  if (fs::exists(path)) {
+    error = "snapshot_path already exists";
+    return false;
+  }
+  if (!global_mapping) {
+    error = "global mapping is disabled";
+    return false;
+  }
+
+  try {
+    // Close only the current local submap so the final part of the driven lap
+    // is included.  Recreate the local mapper immediately afterwards; odometry
+    // and the global mapper remain alive, so map/odom authority never changes.
+    // Swap in a fresh local mapper first (under the mutex, so the callbacks on the other executor
+    // thread never touch a mapper that is being replaced), then finish the old one outside the lock:
+    // the sensor callbacks keep feeding the odometry and the new mapper while this thread waits.
+    std::unique_ptr<AsyncSubMapping> closing;
+    {
+      std::lock_guard<std::mutex> lock(sub_mapping_mutex);
+      if (sub_mapping) {
+        auto next = SubMappingBase::load_module(sub_mapping_so_name);
+        if (!next) {
+          error = "failed to restart local mapping after snapshot";
+          return false;
+        }
+        closing = std::move(sub_mapping);
+        sub_mapping.reset(new AsyncSubMapping(next));
+      }
+    }
+    if (closing) {
+      closing->join();
+      const auto submaps = closing->get_results();
+      for (const auto& submap : submaps) {
+        global_mapping->insert_submap(submap);
+      }
+    }
+
+    // Wait until the global worker has taken the flushed submap.  save() then
+    // takes the same global mutex, so it observes either the completed update
+    // or waits for it rather than writing a half-updated graph.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (global_mapping->workload() > 0 && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (global_mapping->workload() > 0) {
+      error = "timed out while flushing the global map";
+      return false;
+    }
+    global_mapping->save(path);
+    if (!fs::is_regular_file(fs::path(path) / "graph.txt")) {
+      error = "snapshot did not create graph.txt";
+      return false;
+    }
+    return true;
+  } catch (const std::exception& e) {
+    error = e.what();
+    return false;
   }
 }
 
